@@ -1,0 +1,729 @@
+---
+title: "Final project"
+author: "Group V"
+date: "May 9th, 2019"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_library, echo=FALSE}
+library(e1071)
+library(DT)
+library(data.table)
+library(ggplot2)
+library(kernlab)
+library(corrplot)
+library(cowplot)
+library(car)
+library(dplyr)
+library(plyr)
+library(ROSE)
+library(ROCR)
+library(gridExtra)
+library(gridGraphics)
+library(grid)
+
+set.seed(1)
+```
+
+```{r load_dataset}
+# load dataset
+churn <- fread(input = "WA_Fn-UseC_-Telco-Customer-Churn.csv", verbose = FALSE)
+```
+
+```{r constants}
+id.name <- "id"
+gender.name <- "gender"
+SeniorCitizen.name <- "SeniorCitizen"
+Partner.name <- "Partner"
+tenure.name <- "tenure"
+PhoneService.name <- "PhoneService"
+MultipleLines.name <- "MultipleLines"
+InternetService.name <- "InternetService"
+OnlineSecurity.name <- "OnlineSecurity"
+OnlineBackup.name <- "OnlineBackup"
+DeviceProtection.name <- "DeviceProtection"
+TechSupport.name <- "TechSupport"
+StreamingTV.name <- "StreamingTV"
+StreamingMovies.name <- "StreamingMovies"
+Contract.name <- "Contract"
+PaperlessBilling.name <- "PaperlessBilling"
+PaymentMethod.name <- "PaymentMethod"
+MonthlyCharges.name <- "MonthlyCharges"
+TotalCharges.name <- "TotalCharges"
+Churn.name <- "Churn"
+
+col.names <- names(churn)
+continuous_col.names <-c("tenure","MonthlyCharges","TotalCharges")
+
+
+```
+
+
+```{r functions}
+percentage.table <- function(x, digits){
+  tab <- table(x)
+  percentage.tab <- 100*tab/(sum(tab))
+  rounded.tab <- round(x = percentage.tab, digits = digits)
+  return(rounded.tab)
+}
+
+round.numerics <- function(x, digits){
+  if(is.numeric(x)){
+    x <- round(x = x, digits = digits)
+  }
+  return(x)
+}
+
+round.numerics.percent <- function(x, digits){
+  if(is.numeric(x)){
+    x <- round(x = x, digits = digits)
+    x <- paste(x,"%")
+  }
+  return(x)
+}
+
+
+mean.diff <- function(x, y){
+  return(mean(x, na.rm=TRUE) - mean(y, na.rm=TRUE))
+}
+
+factor.to.number <- function(x){
+  x <- factor(x,levels=c("No", "Yes"), labels=c(0,1))
+  return(as.numeric(x))
+}
+
+confusion.matrix.heatmap <- function(confusion_matrix,accuracy_val){
+  TrueValue <- factor(c("No", "No", "Yes", "Yes"))
+  PredictionValue <- factor(c("No", "Yes", "No", "Yes"))
+  Y <- unlist(as.data.frame(confusion_matrix))[9:12]
+  df <- data.frame(TrueValue, PredictionValue, Y)
+  ggplot(data =  df, mapping = aes(x = PredictionValue, y = TrueValue)) + geom_tile(aes(fill = Y), colour = "white") + geom_text(aes(label = sprintf("%1.0f", Y)), vjust = 1) + scale_fill_gradient(low = "lightblue", high = "red") + theme_bw() + theme(legend.position = "none") + labs(title=paste0("Confusion Matrix, accuracy= ",round(accuracy_val,2),"%"))
+ 
+}
+
+roc_plot <- function(pred){
+   roc.pred <- prediction(factor.to.number(pred),factor.to.number(testy))
+   auc <- as.numeric(performance(roc.pred,"auc")@y.values)
+   ROCRperf <- performance(roc.pred,"tpr","fpr")
+   plot(ROCRperf, main=paste0("ROC, auc=",round(auc,2)))
+   return (auc)
+ }
+
+```
+
+
+#Initial Data Exploration
+
+First, let's have a look at the each feature column:
+
+```{r data_summary, warning=FALSE}
+library(arsenal)
+# change the class of columns from char to factor
+changeCols <- colnames(churn)[which(as.vector(churn[,lapply(.SD, class)]) == "character")]
+churn[,(changeCols):= lapply(.SD, as.factor), .SDcols = changeCols]
+# initial data summary
+table_eda <- tableby(Churn ~ ., data = churn[,2:21])
+summary(table_eda, title = "Initial Data Summary")
+```
+
+On the summary table above, the features are summarized by "churn" classes levels - No, Yes and Total. For the numerical features: "SeniorCitizen", "tenure", "MonthlyCharges", and TotalCharges", they are summarized by the mean and overall range; while for the categorical features left, such as "gender", "parterner", "dependents", they are summarized by the corresponding class levels.
+
+Findings:
+1. senior citizen should be factors with binary class instead of numeric class
+2. missing values in TotalCharge
+3. CustomerID is the unique identidifier for each customer, which provides no information when predicting the churn
+
+
+# Data Cleaning
+
+```{r senior_citizen}
+# convert SeniorCitizen as a binary class with two levels 'yes' and 'no'
+churn[,SeniorCitizen:=factor(SeniorCitizen, levels=c(0,1), labels=c("No", "Yes"))]
+# check the class of SeniorCitizen
+summary(tableby(Churn ~ SeniorCitizen, data = churn), title = "Check SeniorCitizen")
+```
+
+```{r check_missing_values}
+# count missing values for each column
+na_count <- sapply(churn, function(y) sum(is.na(y)))
+# visualize the missing counts
+df.missing <- data.frame(feature=names(churn),
+                         Missing=as.numeric(na_count))
+#ggplot(df.missing,aes(x=feature,y=Missing))+geom_bar(stat="identity",color="black",fill="lightblue")+ coord_flip()+labs(title = "Missing Count for each feature")+xlab("")+geom_text(aes(label=Missing), vjust=-1, color="black", size=3.5)
+datatable(df.missing[order(-df.missing$Missing),] )
+```
+
+
+
+```{r handle_NA}
+# delete missing records
+# omit rows where 'x' has a missing value
+churn <- na.omit(churn, cols="TotalCharges")
+# recheck NA again
+na_count2<-sapply(churn, function(x) sum(is.na(x)))
+# visualize the missing counts
+df.missing2 <- data.frame(feature=names(churn),
+                         Missing=as.numeric(na_count2))
+#ggplot(df.missing,aes(x=feature,y=Missing))+geom_bar(stat="identity",color="black",fill="lightblue")+ coord_flip()+labs(title = "Missing Count for each feature")+xlab("")+geom_text(aes(label=Missing), vjust=-1, color="black", size=3.5)
+datatable(df.missing2[order(-df.missing2$Missing),] )
+```
+
+
+```{r exclude_id}
+# remove CustomerId featuren column from the dataset
+churn <- churn[,2:21]
+```
+
+
+# Exploratory Data Analysis 
+
+First, have a look at the first 5 rows of the data:
+
+```{r table_overview}
+# first 5 rows
+datatable(head(churn), rownames = FALSE)
+```
+
+check the relationship between each feature with the target
+
+```{r, eval=FALSE}
+ggplot(churn, aes(x= Churn,  group=gender)) + 
+    geom_bar(aes(y = ..prop.., fill = factor(..x..)), stat="count") +
+    geom_text(aes( label = scales::percent(..prop..),
+                   y= ..prop.. ), stat= "count", vjust = -.5) +
+    labs(y = "Churn/Non-churn Rate",fill="churn") +
+  scale_y_continuous(labels = scales::percent)+facet_grid(~gender)+
+  theme(legend.title = element_blank(),legend.position = "none") 
+
+
+```
+
+```{r, fig.height=12}
+#df.by.churn <- ddply(churn,.(gender), function(x) with(x,data.frame(100*round(table(Churn)/length(Churn),4))))
+
+# Create the barplot
+#ggplot(data=df.by.churn, aes(x=gender, y=Freq, fill=Churn)) +geom_bar(stat="identity") + labs(title="gender",y="Percentage(%)")+geom_text(aes(y=Freq, label=paste0(Freq,"%")), vjust=3.0, color="white", size=5.0)
+
+myplots <- list()  
+m<-1
+# get column names
+col.name<-colnames(churn)
+ # plot the bar chart for all columns grouped by Churn
+for(i in 1:ncol(churn)){
+  df.by.churn <- ddply(churn,.(get(col.name[i])), function(x) 
+    with(x,data.frame(100*round(table(Churn)/length(Churn),4))))
+  df.by.churn<-df.by.churn[c(2,4),]
+  
+    # bar chart for categorical variables
+  if (churn[,class(get(col.name[i]))] == "factor"){
+    myplots[[m]] <- eval(substitute(ggplot(data=df.by.churn,aes(x=df.by.churn[,1], y=Freq, fill=Churn)) + geom_bar(stat="identity", color="black",fill="lightblue") + ylim(0,100) + labs(title=eval(col.name[i]),y="Churn Rate(%)", x="") + geom_text(aes(y=Freq, label=paste0(Freq,"%")), hjust=-0.5, color="black", size=5.0) + coord_flip(), list(i = i)))
+    m <- m+1
+  }
+  
+}
+
+plot_grid(plotlist = myplots, nrow = 4, ncol = 4)
+```
+
+```{r visualization, fig.height=15}
+
+myplots2 <- list()  
+m<-1
+# get column names
+col.name<-colnames(churn)
+ # plot the bar chart for all columns grouped by Churn
+for(i in 2:ncol(churn)){
+  name<-paste0("p",m)
+  
+    # bar chart for categorical variables
+  if (churn[,class(get(col.name[i]))] == "factor"){
+    myplots2[[m]]<-eval(substitute(ggplot(churn, aes(churn[,get(col.name[i])],fill=Churn))+geom_bar(position='fill')+labs(title = col.name[i])+xlab("")+theme(axis.text.x=element_text(angle=30,hjust=1)),list(i = i)))
+  }else{
+   # histogram for continuous variables
+    myplots2[[m]]<-eval(substitute(ggplot(churn, aes(churn[,get(col.name[i])],fill=Churn))+geom_histogram(alpha=0.8,bins=20,position='fill')+labs(title = col.name[i])+xlab("")+theme(axis.text.x=element_text(angle=30,hjust=1)),list(i = i)))
+  }
+  m <- m+1
+}
+
+plot_grid(plotlist = myplots2, nrow = 5, ncol = 4)
+```
+
+
+
+```{r phone_service, fig.height=3,fig.width=4}
+#MultipleLines
+ggplot(churn, aes(churn[,MultipleLines],fill=PhoneService))+geom_bar(position='fill')+labs(title = "MultipleLines")+xlab("")+theme(axis.text.x=element_text(angle=30,hjust=1))
+```
+
+Observations:
+1. "MultipleLines"" vs. "PhoneService": if PhoneService is "No", then Multiplelines is "No phone service"; => delete "PhoneService"
+
+```{r drop_PhoneService}
+# drop TotalCharges column
+churn[,PhoneService:=NULL]
+```
+
+
+Next, for internet service
+```{r internet_service, fig.height=8,fig.width=18}
+
+myplots3 <- list() 
+
+m<-1
+# get column names
+col.name2<-c("OnlineSecurity", "OnlineBackup", "DeviceProtection", "TechSupport", "StreamingTV", "StreamingMovies")
+
+# plot the bar chart for all columns grouped by Churn
+for(i in 1:length(col.name2)){
+    #myplots3[[m]]<-eval(substitute(ggplot(churn, aes(churn[,get(col.name2[i])],fill=InternetService))+geom_bar(position='fill')+labs(title = col.name2[i])+xlab("")+theme(axis.text.x=element_text(angle=30,hjust=1)),list(i = i)))
+  myplots3[[m]]<-eval(substitute(ggplot(churn, aes(churn[,InternetService],fill=get(col.name2[i])))+geom_bar(position='fill')+labs(title = col.name2[i], x="InternetService", fill=col.name2[i], y="percentage")+theme(axis.text.x=element_text(angle=30,hjust=1)),list(i = i)))
+
+  m <- m+1
+}
+
+plot_grid(plotlist = myplots3, nrow = 2, ncol = 3)
+
+```
+
+Observations:
+2. "OnlineSecurity, OnlineBackup, DeviceProtection, TechSupport, StreamingTV, StreamingMovies" vs. "InternetService": if InternetService is "No", then [OnlineSecurity, OnlineBackup, DeviceProtection, TechSupport, StreamingTV, StreamingMovies] are all "No internet service". "InternetService"
+
+
+
+```{r correlation, warning=FALSE}
+# encoding all factor columns as numeric values
+factor.col.name<-col.name[churn[,lapply(X=.SD,FUN="class")]=='factor']
+churn_encoded<-copy(churn)
+churn_encoded<-churn_encoded[,eval(factor.col.name):=lapply(X=.SD,FUN=function(x){as.numeric(x)-1}),.SD=factor.col.name]
+# correlation plots
+#corrplot(cor(churn_encoded),method='square', type="lower",diag=F,tl.col = "black",tl.cex = 0.8,tl.srt=10)
+
+# correlation plots
+corrplot(cor(churn_encoded),method='square', type="lower",diag=F, col = colorRampPalette(c("purple", "lightgreen"))(200), tl.col = "black",tl.cex = 0.8,tl.srt=10)
+
+```
+Observations:
+1. there is high correlation between "TotalCharges" and two other continuous features "tenure", "Monthly Charges", thus we want to further explore the relationship between these three variables. => use scatterplots
+
+```{r continuous_features, fig.height=5,fig.width=15}
+scatterplots <- list() 
+m<-1
+# iterrate for all pairs of continuous vars
+for (i in 1:length(continuous_col.names)){
+  for (j in (i+1):length(continuous_col.names)){
+    # scatterplot
+    scatterplots[[m]]<-eval(substitute(ggplot(data=churn, aes(x=get(continuous_col.names[i]), y=get(continuous_col.names[j]), color=2)) + geom_point(alpha=0.3) + labs(color="",y=eval(continuous_col.names[j]), x=eval(continuous_col.names[i])) + theme(legend.position="none"),list(i = i)))
+    m <- m+1
+  }
+}
+
+plot_grid(plotlist = scatterplots, nrow = 1, ncol = 3)
+ 
+```
+Observations:
+strong linear relationship between three continuous features: "tenure","MonthlyCharges" and "TotalCharges"
+
+```{r check_continuous_relationships, fig.height=3,fig.width=4}
+# get the product of tenure and MonthlyCharges
+continuous.dat <- churn[,.(tenure,MonthlyCharges,TotalCharges, "tenure*MonthlyCharges"=tenure*MonthlyCharges)]
+# use scatterplot to check for the relationship
+ggplot(data=churn, aes(x=tenure*MonthlyCharges, y=TotalCharges, color=2)) + geom_point(alpha=0.1,shape=1) + labs(color="",y="TotalCharges", x="tenure*MonthlyCharges") + theme(legend.position="none") + geom_abline(intercept = 0, slope = 1,color="red", size=0.3)
+```
+Observation:
+there is a strong correlation between "TotalCharges" and "tenure*MonthlyCharges". In order to reduce the variance of the model later, we will drop the "TotalCharges" feature.
+
+```{r drop_TotalCharges}
+# drop TotalCharges column
+churn[,TotalCharges:=NULL]
+
+```
+
+
+Before modeling, checking the distribution of the target variable - "Churn":
+
+```{r imbalanced_target, fig.height=4,fig.width=5}
+# plot the bar chart for churn
+churn.tab <- percentage.table(x = churn[, get(Churn.name)], 2) 
+churn.table<-as.data.table(churn.tab)
+# barplot
+ggplot(churn.table,aes(x=unlist(churn.table[, 1]),y=unlist(churn.table[,2]))) + 
+  geom_bar(stat="identity",color="black",fill="lightblue") + 
+  labs(title= eval(Churn.name), x="",y="percentage(%)") + 
+  geom_text(aes(label=paste0(unlist(churn.table[,2]),"%"),y=unlist(churn.table[,2])+2.0), size=4)
+
+```
+
+Observations:
+More than 70% target values are "No", and less than 30% are "Yes". The number of "No" class is neanly three times of the "Yes" class, indicating the dataset is imbalanced in its target values. 
+Thus,
+1. use oversampling/undersampling techniques before the train_test_split
+2. use metrics like "confusion matrix", "auc-roc" instead of accuracy when evaluating the performance of the model
+
+```{r clustring_for_new_feature, fig.height=4, fig.width=5}
+# encoding all factor columns as numeric values to find kmeans 
+factor.col.name<-col.name[churn[,lapply(X=.SD,FUN="class")]=='factor']
+churn_encoded<-copy(churn)
+churn_encoded<-churn_encoded[,eval(factor.col.name):=lapply(X=.SD,FUN=function(x){as.numeric(x)-1}),.SD=factor.col.name]
+
+#Total within sum of squares plot suggests 3 as the best cluster 
+within_ss = sapply(1:10,FUN = function(x) kmeans(x = churn_encoded,centers = x,iter.max = 1000,nstart = 25)$tot.withinss)
+ggplot(data=data.frame(cluster = 1:10,within_ss),aes(x=cluster,y=within_ss))+
+  geom_line(col='steelblue',size=1.2)+
+  geom_point()+
+  scale_x_continuous(breaks=seq(1,10,1))
+
+#Mclust suggests 3 as the best cluster 
+library(mclust)
+# get the bic vs cluster curve , find the elbow point
+mclust_bic = -sapply(1:10,FUN = function(x) Mclust(churn[,1:18],G=x)$bic)
+# the elbow curve
+ggplot(data=data.frame(cluster = 1:10,bic = mclust_bic),aes(x=cluster,y=bic))+geom_line(col='steelblue',size=1.2) + geom_point() + scale_x_continuous(breaks=seq(1,10,1)) + labs(title="Elbow Curve for cluster number selection")
+
+# chooses 3 as cluster number
+
+```
+
+
+```{r clustering_visualiz, fig.height=4,fig.height=5}
+#Kmeans
+km = kmeans(x = churn_encoded,centers = 3,iter.max=10000,nstart=100)
+library(flexclust)
+km_kcca = as.kcca(km,churn_encoded) # flexclust uses objects of the classes kcca
+churn_cluster = predict(km_kcca)
+library(psych)
+temp = data.frame(cluster = factor(churn_cluster),
+           factor1 = fa(churn_encoded[,1:18],nfactors = 2,rotate = 'varimax')$scores[,1],
+           factor2 = fa(churn_encoded[,1:18],nfactors = 2,rotate = 'varimax')$scores[,2])
+ggplot(temp,aes(x=factor1,y=factor2,col=cluster)) + geom_point() + labs(title="Clustering Assignments")
+table(churn_cluster) #looking at distribution 
+
+#Mclust 
+m_clusters = Mclust(data = churn[,1:18],G = 3)
+m_segments = m_clusters$classification
+library(psych)
+temp = data.frame(cluster = factor(m_segments),
+           factor1 = fa(churn_encoded[,1:18],nfactors = 2,rotate = 'varimax')$scores[,1],
+           factor2 = fa(churn_encoded[,1:18],nfactors = 2,rotate = 'varimax')$scores[,2])
+ggplot(temp,aes(x=factor1,y=factor2,col=cluster)) + geom_point() + labs(title="Clustering Assignments")
+table(m_segments) #looking at distribution 
+
+```
+
+
+```{r add_clusters_into_dataset}
+# add the cluster assignments as a new feature into our dataset
+churn[,"Cluster_Msegments":=m_segments]
+churn[,"Cluster_Kmeans" :=churn_cluster]
+
+#evaluation of kmeans cluster 
+churn[,lapply(.SD, mean), by="Cluster_Kmeans", .SDcols = c("MonthlyCharges", "tenure")][order(Cluster_Kmeans)]
+#prop.table(table(churn$Cluster_Kmeans, churn$Contract))*100
+
+#evaluation of Mclust clusters
+churn[,lapply(.SD, mean), by="Cluster_Msegments", .SDcols = c("MonthlyCharges", "tenure")][order(Cluster_Msegments)]
+#prop.table(table(churn$Cluster_Msegments, churn$Contract))*100
+
+# drop Mcluster column
+churn[,Cluster_Msegments:=NULL]
+
+```
+
+
+ Before the train_test_split, we need to deal with the imbalanced dataset
+```{r handle_imbalanced_dataset, fig.height=4, fig.width=8, warning=FALSE}
+# BEFORE
+# plot the bar chart for churn
+churn.tab <- percentage.table(x = churn[, get(Churn.name)], 2) 
+churn.table<-as.data.table(churn.tab)
+# barplot
+before_plot<-ggplot(churn.table,aes(x=unlist(churn.table[, 1]),y=unlist(churn.table[,2]))) + 
+  geom_bar(stat="identity",color="black",fill="lightblue") + 
+  labs(title="Before Sampling" , x=eval(Churn.name),y="percentage(%)") + 
+  geom_text(aes(label=paste0(unlist(churn.table[,2]),"%"),y=unlist(churn.table[,2])+3.8), size=4)
+
+#AFTER
+churn.mod <- ovun.sample(Churn ~ ., data = churn, method = "over",N = 5174*2)$data
+# after oversampling
+churn.mod.tab <- table(churn.mod$Churn)/dim(churn.mod)[1]
+# barplot
+after_plot <- ggplot(churn.table,aes(x=c("No","Yes"),y=100*unlist(churn.mod.tab))) + 
+  geom_bar(stat="identity",color="black",fill="lightblue") + 
+  labs(title="After Sampling" , x=eval(Churn.name),y="percentage(%)") + 
+  geom_text(aes(label=paste0(round.numerics(100*unlist(churn.mod.tab),2),"%"),y=100*unlist(churn.mod.tab)+3.8), size=4)
+
+plot_grid(before_plot,after_plot)
+```
+
+# MODELING
+
+```{r train_test_split}
+# train-test split
+indexes <- sample(1:nrow(churn), size=0.3*nrow(churn.mod))
+test <- churn.mod[indexes,]
+train <- churn.mod[-indexes,]
+# trainx,trainy,testx,testy
+trainx <- train[,!names(train) %in% "Churn"]
+trainy <- train$Churn
+testx <- test[,!names(test) %in% "Churn"]
+testy <- test$Churn
+```
+
+```{r function}
+misclassification.train.rate <- function(model){
+  predict <- model$pred[,1]
+  misclassify <- mean(as.numeric(predict))-1
+  return (misclassify)
+}
+misclassification.test.rate <- function(model){
+  predicted.test <- predict(model, testx)
+  return (mean(as.vector(predicted.test)!=testy))
+}
+```
+
+
+## LogisticRegression Model
+ 
+```{r glm, warning=FALSE, fig.height=4, fig.width=5}
+# logistic regression
+library(caret)
+# build model
+glm.model <- glm(Churn~., data=train, family=binomial)
+# predict
+glm.pred <- predict(glm.model,type='response', newdata = test)
+glm.pred <-ifelse(glm.pred > 0.5, "Yes", "No")
+# confusionMatrix
+glm.confusion<-confusionMatrix(factor(glm.pred),factor(testy))$table
+# accuracy
+accuracy.lr <- sum(glm.confusion[1,1],glm.confusion[2,2])/nrow(test)*100 
+
+# plot confusion matrix as a heatmap
+confusion.matrix.heatmap(glm.confusion, accuracy.lr)
+
+# plot roc curve
+auc.lr=roc_plot(glm.pred)
+
+# summary table
+lr.summary <- data.table(Model="LogisticRegression", Accuracy=accuracy.lr,
+           Precision=100*precision(glm.confusion), Recall=100*recall(glm.confusion),
+           Fscore=100*F_meas(glm.confusion),AUC=100*auc.lr)
+lr.summary <- lr.summary[,lapply(X=.SD, FUN="round.numerics.percent",digits = 2)]
+datatable(lr.summary, rownames = FALSE)
+
+```
+
+## RandomForest Model
+
+```{r random forest}
+library("randomForest")
+# random forest
+rf.model <- randomForest(Churn ~., data = train)
+#print(rf.model) #79.75%
+rf.pred <- predict(rf.model, test)
+#plot(rf.model)
+
+#Tunning (From the rf.model plot, we see that error won't decrease much after ntree=100, so we choose ntree=100)
+#tune.rf <- tuneRF(train[, -18],unlist(train[, 18]), stepFactor = 0.5, plot = TRUE, ntreeTry = 100, trace = TRUE, improve = 0.05)
+# Because the OOB error is lowest at mtry=2, so we use mtry=2.
+new.rfModel<- randomForest(Churn ~., data = train, ntree = 100, mtry = 8, importance = TRUE, proximity = TRUE)
+#print(new.rfModel) #79.08%
+pred.rfnew.model <- predict(new.rfModel, testx)
+
+# confusionMatrix
+rf.confusion <- confusionMatrix(factor(pred.rfnew.model),factor(testy))$table
+
+# accuracy
+accuracy.rf <- sum(rf.confusion[1,1],rf.confusion[2,2])/nrow(test)*100 
+
+# feature importance
+#importance(new.rfModel)
+
+# plot confusion matrix as a heatmap
+confusion.matrix.heatmap(rf.confusion, accuracy.rf)
+
+# plot roc curve
+auc.rf = roc_plot(pred.rfnew.model)
+
+# summary table
+rf.summary <- data.table(Model="RandomForest", Accuracy=accuracy.rf,
+           Precision=100*precision(rf.confusion), Recall=100*recall(rf.confusion),
+           Fscore=100*F_meas(rf.confusion),AUC=100*auc.rf)
+rf.summary <- rf.summary[,lapply(X=.SD, FUN="round.numerics.percent",digits = 2)]
+datatable(rf.summary, rownames = FALSE)
+
+```
+
+## SupportVectorMachine Model
+
+```{r svm}
+library(caret)
+#svm.mod.linear <- svm(Churn~., data=train, kernel="linear") 
+#svm.mod.poly <- svm(Churn~., data=train, kernel="poly") 
+#svm.mod.radial <- svm(Churn~., data=train, kernel="radial") 
+
+#misclassification.test.rate(svm.mod.linear)
+#misclassification.test.rate(svm.mod.poly)
+#1-misclassification.test.rate(svm.mod.radial) #0.8032
+
+# define training control
+train_control<- trainControl(method="cv", number=5, savePredictions = TRUE)
+
+# train the model 
+svm.mod.radial.cv <- train(Churn~., data=train, trControl=train_control, method="svmRadial")
+# predict
+svm.pred <- predict(svm.mod.radial.cv, testx)
+
+# confusionMatrix
+svm.confusion <- confusionMatrix(svm.pred,testy)$table
+
+# accuracy
+accuracy.svm <- sum(svm.confusion[1,1],svm.confusion[2,2])/nrow(test)*100 
+
+# plot confusion matrix as a heatmap
+confusion.matrix.heatmap(svm.confusion, accuracy.svm)
+
+# plot roc curve
+auc.svm = roc_plot(svm.pred)
+
+# summary table
+svm.summary <- data.table(Model="SupportVectorMachine", Accuracy=accuracy.svm,
+           Precision=100*precision(svm.confusion), Recall=100*recall(svm.confusion),
+           Fscore=100*F_meas(svm.confusion), AUC=100*auc.svm)
+svm.summary <- svm.summary[,lapply(X=.SD, FUN="round.numerics.percent",digits = 2)]
+datatable(svm.summary, rownames = FALSE)
+
+```
+
+
+## xgBoost Model
+
+```{r xgboost}
+library(xgboost)
+
+churn.num <- data.table(churn.mod)
+
+# change the class of columns from char to numeric
+churn.num[,eval(factor.col.name):=lapply(X=.SD,FUN=function(x){as.numeric(x)-1}),.SD=factor.col.name]
+
+train_num <- churn.num[-indexes,]
+test_num <- churn.num[indexes,]
+
+xgtrain <- xgb.DMatrix(data = as.matrix(train_num[,-18]),label = train_num$Churn) 
+xgtest <- xgb.DMatrix(data = as.matrix(test_num[,-18]),label = test_num$Churn) 
+
+params <- list(booster = "gbtree", objective = "binary:logistic", eta=0.3, gamma=0, max_depth=6, min_child_weight=1, subsample=1, colsample_bytree=1)
+
+xgbcv <- xgb.cv(params = params, data = xgtrain, nrounds = 100, nfold = 5, showsd = T, stratified = T, print_every_n = 10, early_stopping_rounds = 20, maximize = F, verbose = F)
+
+xgb <- xgb.train(params = params, data = xgtrain, nrounds = xgbcv$best_iteration, watchlist = list(val=xgtest,train=xgtrain), verbose = F, eval_metric = "error")
+
+#predict
+xgb.pred <- predict (xgb,xgtest)
+xgb.pred <- ifelse (xgb.pred > 0.5, "Yes", "No")
+
+# confusionMatrix
+xgb.confusion <- confusionMatrix(factor(xgb.pred),factor(testy))$table
+
+# accuracy
+accuracy.xgb <- sum(xgb.confusion[1,1],xgb.confusion[2,2])/nrow(test)*100 
+
+# plot confusion matrix as a heatmap
+confusion.matrix.heatmap(xgb.confusion, accuracy.xgb)
+
+# plot roc curve
+auc.xgb <- roc_plot(xgb.pred)
+
+# summary table
+xgb.summary <- data.table(Model="xgBoost", Accuracy=accuracy.xgb,
+           Precision=100*precision(xgb.confusion), Recall=100*recall(xgb.confusion),
+           Fscore=100*F_meas(xgb.confusion), AUC=100*auc.xgb)
+xgb.summary <- xgb.summary[,lapply(X=.SD, FUN="round.numerics.percent",digits = 2)]
+datatable(xgb.summary, rownames = FALSE)
+
+# feature importance
+important.features <- xgb.importance(feature_names=colnames(xgtrain), model = xgb)
+xgb.plot.importance (importance_matrix = important.features)
+```
+
+## Model Comparison
+
+```{r model_comparison}
+# combine all model summary 
+model.summary <- rbind(lr.summary, rf.summary, svm.summary, xgb.summary)
+# order the table on Accuracy in decreasing order
+setorder(model.summary, -Accuracy)
+datatable(model.summary, rownames = FALSE)
+```
+
+# Final Model
+```{r final_best_model}
+# Check Importance
+rf.importance.tab <- as.data.frame(importance(new.rfModel))
+setDT(rf.importance.tab, keep.rownames = TRUE)[]
+# plot the importance bar chart
+ggplot(rf.importance.tab,aes(x=reorder(rn,MeanDecreaseGini) ,y=MeanDecreaseGini)) +
+  geom_bar(stat="identity",color="black",fill="lightblue") + labs(title="Importance of features" , x="",y="MeanDecreaseGini") + coord_flip()
+
+
+#New data without the lowest Gini score
+#rf.model.dele <- randomForest(Churn~ gender+Partner +Dependents  +tenure+MultipleLines+InternetService+OnlineSecurity+OnlineBackup+DeviceProtection+TechSupport+Contract+PaperlessBilling+PaymentMethod+MonthlyCharges+Cluster_Kmeans, data = train)
+
+#choose ntreeTry
+#plot(rf.model.dele)
+
+#choose mtry
+#tune.rf <- tuneRF(train[, -c(2,12,13,18)],unlist(train[, 18]), stepFactor = 0.5, plot = TRUE, ntreeTry = 100, trace = TRUE, improve = 0.05)
+
+elimination.model <- randomForest(Churn~ gender+Partner +Dependents  +tenure+MultipleLines+InternetService+OnlineSecurity+OnlineBackup+DeviceProtection+TechSupport+Contract+PaperlessBilling+PaymentMethod+MonthlyCharges+Cluster_Kmeans,data=train, ntree = 100, mtry = 6, importance = TRUE, proximity = TRUE)
+
+pred.elimination.model <- predict(elimination.model, testx)
+
+# confusionMatrix
+rf.elimination.confusion <- confusionMatrix(factor(pred.elimination.model),factor(testy))$table
+
+# accuracy
+accuracy.rf.elimination <- sum(rf.elimination.confusion[1,1],rf.elimination.confusion[2,2])/nrow(test)*100 
+
+# plot confusion matrix as a heatmap
+confusion.matrix.heatmap(rf.elimination.confusion, accuracy.rf.elimination)
+
+# plot roc curve
+auc.rf.elimibation <- roc_plot(pred.elimination.model)
+
+# summary table
+rf.elimination.summary <- data.table(Model="RandomForest(drop cols)",
+                                     Accuracy=accuracy.rf.elimination,
+           Precision=100*precision(rf.elimination.confusion),
+           Recall=100*recall(rf.elimination.confusion),
+           Fscore=100*F_meas(rf.elimination.confusion),
+           AUC = 100*auc.rf.elimibation)
+rf.elimination.summary <- rf.elimination.summary[,lapply(X=.SD, FUN="round.numerics.percent",digits = 2)]
+
+
+```
+
+
+```{r final_model_summary}
+# combine all model summary 
+update.model.summary <- rbind(model.summary,rf.elimination.summary)
+setorder(update.model.summary, -Accuracy)
+datatable(update.model.summary, rownames = FALSE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
